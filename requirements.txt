@@ -3,6 +3,7 @@ qdarkstyle>=3.2
 openai>=1.40
 appdirs>=1.4
 cryptography>=42.0
+soundcard>=0.4.3
 sounddevice>=0.4.7
 soundfile>=0.12
 numpy>=1.24
