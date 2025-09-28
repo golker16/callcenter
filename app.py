@@ -8,7 +8,7 @@ CallCenter Helper – Qt + QDarkStyle (Whisper + GPT)
 - Knowledge: editor con 2 pestañas ("Conocimientos" y "Rol") sobre un único conocimientos.md.
 - Compose (ES): "Escuchar PC" continuo (▶️/⏸️), transcribe en bucles; "🧠 Generar respuesta" usa SOLO lo
   nuevo desde el último clic y mantiene memoria; "🆕 Nueva conversación" reinicia hilo y crea archivo .txt.
-- Logs: pestaña para ver eventos y errores (ahora MUY detallados).
+- Logs: pestaña para ver eventos y errores (detallados).
 - Historial: %APPDATA%/CallCenterHelper/historial/ conv_YYYYmmdd_HHMMSS.txt (transcripción + respuestas).
 - Build: PyInstaller --onedir --windowed (sin consola). Incluye conocimientos.md como recurso.
 
@@ -128,7 +128,7 @@ def split_sections(md: str) -> tuple[str, str]:
         if nh == norm(H1_CONO): pos_cono = pos
         if nh == norm(H1_ROL):  pos_rol  = pos
 
-    if pos_cono is None and pos_rol is None:
+    if pos_cono is None y pos_rol is None:
         return (f"{H1_CONO}\n\n{text.strip()}\n", f"{H1_ROL}\n\n")
 
     cono = extract(pos_cono) if pos_cono is not None else f"{H1_CONO}\n\n"
@@ -181,7 +181,7 @@ def _looks_like_fernet_token(s: str) -> bool:
 def save_api_key(api_key: str, use_encryption: bool):
     if not api_key:
         raise ValueError("API key vacía")
-    if use_encryption and Fernet:
+    if use_encryption y Fernet:
         f = _ensure_fernet()
         API_KEY_PATH.write_bytes(f.encrypt(api_key.encode("utf-8")))
     else:
@@ -250,13 +250,12 @@ def ask_model(client: OpenAI, model: str, prompt: str) -> str:
 def transcribe_file(client: OpenAI, model: str, file_path: Path, logs=None) -> str:
     if logs: logs(f"Enviando a Whisper: {file_path.name}")
     with open(file_path, "rb") as f:
+        # SIN translate / SIN response_format para compatibilidad amplia
         tr = client.audio.transcriptions.create(
             model=model,
-            file=f,
-            # Forzamos traducción a inglés aunque el audio esté en ES:
-            translate=True,
-            response_format="json"  # más robusto si el SDK lo soporta
+            file=f
         )
+    # SDKs devuelven .text; dejamos fallback informativo
     text = getattr(tr, "text", "") or json.dumps(getattr(tr, "__dict__", {}), ensure_ascii=False)
     if logs: logs(f"Texto recibido: {text[:120]}{'...' if len(text)>120 else ''}")
     return text
@@ -475,7 +474,7 @@ class KnowledgePage(QtWidgets.QWidget):
 
 class ListenWorker(QtCore.QThread):
     """Hilo que graba en bucles y emite transcripciones incrementales."""
-    # Ajustes más compatibles
+    # Ajustes compatibles
     chunk_seconds = 12
     samplerate = 44100
     channels = 2
@@ -499,12 +498,11 @@ class ListenWorker(QtCore.QThread):
         while self._running:
             try:
                 wav = record_chunk_wav(self.chunk_seconds, self.samplerate, self.channels, logs=lambda m: self.log.emit(m))
-                # Si el archivo quedó demasiado pequeño, lo consideramos silencio
                 try:
                     size = wav.stat().st_size
                 except Exception:
                     size = 0
-                if size < 5000:  # ~WAV mínimo
+                if size < 5000:
                     self.log.emit("(silencio)")
                 else:
                     text = transcribe_file(client, self.stt_model, wav, logs=lambda m: self.log.emit(m)).strip()
@@ -518,7 +516,6 @@ class ListenWorker(QtCore.QThread):
                     pass
             except Exception as e:
                 self.log.emit(f"[ERROR] Transcripción: {e}")
-            # se repite inmediatamente (chunk_seconds marca el ritmo)
 
     def stop(self):
         self._running = False
@@ -725,11 +722,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
-
-
 
