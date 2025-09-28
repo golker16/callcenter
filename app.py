@@ -3,10 +3,10 @@
 CallCenter Helper – Qt + QDarkStyle (Whisper + GPT)
 ---------------------------------------------------
 - Modelo por defecto: gpt-3.5-turbo (bajo costo).
-- UI: PySide6 + QDarkStyle (modo oscuro).
+- UI: PySide6 + QDarkStyle (oscuro).
 - Settings: guarda/lee API Key (cifrado local opcional).
 - Knowledge: editor con 2 pestañas ("Conocimientos" y "Rol") sobre un único conocimientos.md.
-- Compose: pegas texto de llamada y genera respuesta en inglés usando el KB.
+- Compose (ES): dos modos -> "Escuchar PC (beta)" (transcribe) y "Escribir" (genera respuesta).
 - Logs: pestaña para ver eventos y errores.
 - Build: PyInstaller --onedir --windowed (sin consola). Incluye conocimientos.md como recurso.
 
@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +44,14 @@ try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
+
+# Audio (Escuchar PC / micrófono)
+try:
+    import sounddevice as sd
+    import soundfile as sf
+except Exception:
+    sd = None
+    sf = None
 
 APP_NAME = "CallCenterHelper"
 ORG = "GG"
@@ -75,7 +84,7 @@ def ensure_knowledge_file():
     if src.exists():
         KNOWLEDGE_PATH.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     else:
-        # fallback mínimo
+        # Fallback mínimo
         KNOWLEDGE_PATH.write_text("# Conocimientos del call center\n\n# Rol\n\n", encoding="utf-8")
 
 def read_knowledge() -> str:
@@ -88,59 +97,65 @@ def write_knowledge(text: str):
 # ------------------------
 # Knowledge split/merge (robusto)
 # ------------------------
-# Captura secciones por encabezado H1 exacto, preservando TODO el contenido.
+# Acepta variaciones de espacios y mayúsculas/minúsculas.
 H1_CONO = "# Conocimientos del call center"
 H1_ROL  = "# Rol"
 
+def _find_h1_positions(md: str) -> list[tuple[int, str]]:
+    """Devuelve [(pos, título-normalizado)] de todos los H1."""
+    text = md.replace("\r\n", "\n")
+    out = []
+    for m in re.finditer(r'(?im)^\s*#\s*(.+?)\s*$', text):
+        title = m.group(1).strip()
+        out.append((m.start(), "# " + title))
+    return out
+
 def split_sections(md: str) -> tuple[str, str]:
     """
-    Separa el markdown en dos secciones por H1 exactos:
+    Separa el markdown en dos secciones por H1:
     '# Conocimientos del call center' y '# Rol'.
-    - Si falta alguno, lo crea vacío.
-    - No pierde contenido: se basa en posiciones de encabezados.
-
-    Devuelve (cono_md, rol_md) INCLUYENDO los encabezados.
+    Preserva TODO el contenido. Si falta alguno, se crea vacío.
     """
     text = md.replace("\r\n", "\n")
-    # Encuentra posiciones de encabezados con regex multilínea estricto
-    # ^# Título$
-    matches = list(re.finditer(r'(?m)^(# .+)$', text))
-    # Mapa de título -> índice en texto
-    idx = {m.group(1).strip(): m.start() for m in matches}
+    headers = _find_h1_positions(text)
+    # mapa por título normalizado (lower, sin dobles espacios)
+    def norm(s: str) -> str:
+        return re.sub(r'\s+', ' ', s.strip().lower())
 
-    # Helper para extraer desde un header hasta el siguiente o fin
-    def extract(start_title: str) -> str | None:
-        if start_title not in idx:
-            return None
-        start = idx[start_title]
-        # siguiente header después de 'start'
-        end = None
-        for m in matches:
-            if m.start() > start:
-                end = m.start()
-                break
-        chunk = text[start:end].strip() + "\n"
-        return chunk
+    idx = {norm(h): pos for pos, h in headers}
+    n_cono = norm(H1_CONO)
+    n_rol  = norm(H1_ROL)
 
-    cono = extract(H1_CONO)
-    rol  = extract(H1_ROL)
+    def extract(start_pos: int) -> str:
+        # tramo desde start_pos hasta el siguiente H1 o fin
+        h_starts = sorted([p for p, _ in headers])
+        next_starts = [p for p in h_starts if p > start_pos]
+        end = next_starts[0] if next_starts else len(text)
+        return text[start_pos:end].strip() + "\n"
 
-    if cono is None and rol is None:
-        # No hay encabezados: todo va a conocimientos, rol vacío
+    # Buscar posiciones (aceptando variantes de espacios y case)
+    pos_cono = None
+    pos_rol = None
+    for pos, h in headers:
+        if norm(h) == n_cono:
+            pos_cono = pos
+        if norm(h) == n_rol:
+            pos_rol = pos
+
+    if pos_cono is None and pos_rol is None:
+        # No hay H1 reconocidos → todo a conocimientos
         return (f"{H1_CONO}\n\n{text.strip()}\n", f"{H1_ROL}\n\n")
 
-    if cono is None:
-        cono = f"{H1_CONO}\n\n"
-    if rol is None:
-        rol = f"{H1_ROL}\n\n"
+    cono = extract(pos_cono) if pos_cono is not None else f"{H1_CONO}\n\n"
+    rol  = extract(pos_rol)  if pos_rol  is not None else f"{H1_ROL}\n\n"
     return (cono, rol)
 
 def merge_sections(cono_md: str, rol_md: str) -> str:
     cono_md = cono_md.strip()
-    rol_md = rol_md.strip()
-    if not cono_md.lower().startswith(H1_CONO.lower()):
+    rol_md  = rol_md.strip()
+    if not re.match(r'(?is)^\s*#\s*conocimientos del call center', cono_md):
         cono_md = f"{H1_CONO}\n\n{cono_md}"
-    if not rol_md.lower().startswith(H1_ROL.lower()):
+    if not re.match(r'(?is)^\s*#\s*rol', rol_md):
         rol_md = f"{H1_ROL}\n\n{rol_md}"
     return f"{cono_md}\n\n{rol_md}\n"
 
@@ -229,6 +244,62 @@ def ask_model(client: OpenAI, model: str, prompt: str) -> str:
     except Exception:
         return getattr(resp, "output_text", "(no text)").strip()
 
+def transcribe_file(client: OpenAI, model: str, file_path: Path) -> str:
+    with open(file_path, "rb") as f:
+        tr = client.audio.transcriptions.create(model=model, file=f)
+    # SDK suele exponer .text
+    text = getattr(tr, "text", None)
+    if not text:
+        # por si cambia el esquema
+        text = json.dumps(tr.__dict__, ensure_ascii=False)
+    return text
+
+# ------------------------
+# Audio helpers (Escuchar PC / Mic)
+# ------------------------
+def record_system_or_mic_wav(seconds: int, samplerate: int = 48000, channels: int = 2, logs: callable | None = None) -> Path:
+    """
+    Intenta capturar LOOPBACK (audio del sistema) con WASAPI.
+    Si falla, cae a micrófono. Requiere sounddevice + soundfile.
+    Devuelve ruta a WAV temporal.
+    """
+    if sd is None or sf is None:
+        raise RuntimeError("Falta instalar 'sounddevice' y 'soundfile'.")
+
+    tmp = Path(tempfile.gettempdir()) / f"cchelper_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+
+    try:
+        # WASAPI loopback (Windows)
+        wasapi = sd.WasapiSettings(loopback=True)
+        if logs: logs("Intentando capturar audio del sistema (WASAPI loopback)…")
+        frames = int(seconds * samplerate)
+        buf = []
+
+        def callback(indata, frames_, time_, status):
+            if status and logs:
+                logs(f"sd status: {status}")
+            buf.append(indata.copy())
+
+        with sd.InputStream(samplerate=samplerate, channels=channels, dtype="float32",
+                            extra_settings=wasapi, callback=callback):
+            sd.sleep(int(seconds * 1000))
+
+        import numpy as np
+        data = np.concatenate(buf, axis=0) if buf else np.zeros((1, channels), dtype="float32")
+        sf.write(tmp.as_posix(), data, samplerate)
+        if logs: logs(f"Audio capturado en {tmp}")
+        return tmp
+
+    except Exception as e:
+        if logs: logs(f"Loopback falló ({e}). Usando micrófono…")
+        # Micrófono
+        import numpy as np
+        recording = sd.rec(int(seconds * samplerate), samplerate=samplerate, channels=1, dtype="float32")
+        sd.wait()
+        sf.write(tmp.as_posix(), recording, samplerate)
+        if logs: logs(f"Audio de micrófono guardado en {tmp}")
+        return tmp
+
 # ------------------------
 # UI – Pages
 # ------------------------
@@ -244,9 +315,9 @@ class SettingsPage(QtWidgets.QWidget):
         self.api_edit = QtWidgets.QLineEdit()
         self.api_edit.setEchoMode(QtWidgets.QLineEdit.Password)
         if load_api_key(self.cfg.use_encryption):
-            self.api_edit.setPlaceholderText("*** saved ***")
+            self.api_edit.setPlaceholderText("*** guardada ***")
 
-        self.show_chk = QtWidgets.QCheckBox("Show")
+        self.show_chk = QtWidgets.QCheckBox("Mostrar")
         self.show_chk.toggled.connect(
             lambda on: self.api_edit.setEchoMode(QtWidgets.QLineEdit.Normal if on else QtWidgets.QLineEdit.Password)
         )
@@ -260,16 +331,16 @@ class SettingsPage(QtWidgets.QWidget):
         self.stt_cb.addItems(["whisper-1", "gpt-4o-transcribe"])
         self.stt_cb.setCurrentText(self.cfg.transcribe_model)
 
-        self.encrypt_chk = QtWidgets.QCheckBox("Encrypt API key (recommended)")
+        self.encrypt_chk = QtWidgets.QCheckBox("Cifrar API key (recomendado)")
         self.encrypt_chk.setChecked(bool(self.cfg.use_encryption and (Fernet is not None)))
 
-        save_btn = QtWidgets.QPushButton("Save settings")
+        save_btn = QtWidgets.QPushButton("Guardar")
         save_btn.clicked.connect(self._save)
 
         form.addRow("OpenAI API Key:", self.api_edit)
         form.addRow("", self.show_chk)
-        form.addRow("Chat model:", self.model_cb)
-        form.addRow("Transcribe model:", self.stt_cb)
+        form.addRow("Modelo de chat:", self.model_cb)
+        form.addRow("Modelo de transcripción:", self.stt_cb)
         form.addRow("", self.encrypt_chk)
         form.addRow("", save_btn)
 
@@ -280,20 +351,20 @@ class SettingsPage(QtWidgets.QWidget):
         self.cfg.save()
 
         val = self.api_edit.text().strip()
-        if val and val != "*** saved ***":
+        if val and val != "*** guardada ***":
             try:
                 save_api_key(val, self.cfg.use_encryption)
                 self.api_edit.clear()
-                self.api_edit.setPlaceholderText("*** saved ***")
-                self.log_signal.emit("API key saved.")
-                QtWidgets.QMessageBox.information(self, "Saved", "Settings saved and API key stored.")
+                self.api_edit.setPlaceholderText("*** guardada ***")
+                self.log_signal.emit("API key guardada.")
+                QtWidgets.QMessageBox.information(self, "Guardado", "Configuración guardada y API key almacenada.")
             except Exception as e:
-                self.log_signal.emit(f"[ERROR] Saving API key: {e}")
-                QtWidgets.QMessageBox.critical(self, "Error", f"Cannot save API key: {e}")
+                self.log_signal.emit(f"[ERROR] Guardando API key: {e}")
+                QtWidgets.QMessageBox.critical(self, "Error", f"No se pudo guardar la API key: {e}")
                 return
         else:
-            QtWidgets.QMessageBox.information(self, "Saved", "Settings saved.")
-            self.log_signal.emit("Settings saved.")
+            QtWidgets.QMessageBox.information(self, "Guardado", "Configuración guardada.")
+            self.log_signal.emit("Configuración guardada.")
 
 class KnowledgePage(QtWidgets.QWidget):
     log_signal = QtCore.Signal(str)
@@ -305,14 +376,12 @@ class KnowledgePage(QtWidgets.QWidget):
 
         v = QtWidgets.QVBoxLayout(self)
 
-        # Pestañas izquierda/derecha: usamos QTabWidget (primera pestaña por defecto)
         self.tabs = QtWidgets.QTabWidget()
         v.addWidget(self.tabs)
 
         self.cono_edit = QtWidgets.QPlainTextEdit()
         self.rol_edit  = QtWidgets.QPlainTextEdit()
 
-        # Cargamos contenido con parser robusto (no se pierde nada)
         full = read_knowledge()
         cono_md, rol_md = split_sections(full)
         self.cono_edit.setPlainText(cono_md)
@@ -322,11 +391,10 @@ class KnowledgePage(QtWidgets.QWidget):
         self.tabs.addTab(self.rol_edit, "Rol")
         self.tabs.setCurrentIndex(0)  # por defecto la primera
 
-        # Botonera
         h = QtWidgets.QHBoxLayout()
-        save_btn = QtWidgets.QPushButton("Save")
-        export_btn = QtWidgets.QPushButton("Export .md")
-        import_btn = QtWidgets.QPushButton("Import .md")
+        save_btn = QtWidgets.QPushButton("Guardar")
+        export_btn = QtWidgets.QPushButton("Exportar .md")
+        import_btn = QtWidgets.QPushButton("Importar .md")
         h.addWidget(save_btn); h.addWidget(export_btn); h.addWidget(import_btn); h.addStretch(1)
         v.addLayout(h)
 
@@ -338,24 +406,24 @@ class KnowledgePage(QtWidgets.QWidget):
         merged = merge_sections(self.cono_edit.toPlainText(), self.rol_edit.toPlainText())
         write_knowledge(merged)
         self.knowledge_changed.emit()
-        self.log_signal.emit("Knowledge saved.")
-        QtWidgets.QMessageBox.information(self, "Saved", "Knowledge saved successfully.")
+        self.log_signal.emit("Conocimientos guardados.")
+        QtWidgets.QMessageBox.information(self, "Guardado", "Conocimientos guardados correctamente.")
 
     def _export(self):
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export as...", str(Path.home()/ "conocimientos.md"), "Markdown (*.md)")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Exportar como...", str(Path.home()/ "conocimientos.md"), "Markdown (*.md)")
         if not path:
             return
         try:
             merged = merge_sections(self.cono_edit.toPlainText(), self.rol_edit.toPlainText())
             Path(path).write_text(merged, encoding="utf-8")
-            self.log_signal.emit(f"Knowledge exported to {path}")
-            QtWidgets.QMessageBox.information(self, "Exported", f"Wrote file to\n{path}")
+            self.log_signal.emit(f"Exportado a {path}")
+            QtWidgets.QMessageBox.information(self, "Exportado", f"Archivo escrito en:\n{path}")
         except Exception as e:
-            self.log_signal.emit(f"[ERROR] Export: {e}")
-            QtWidgets.QMessageBox.critical(self, "Error", f"Cannot export: {e}")
+            self.log_signal.emit(f"[ERROR] Exportar: {e}")
+            QtWidgets.QMessageBox.critical(self, "Error", f"No se pudo exportar: {e}")
 
     def _import(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import .md", str(Path.home()), "Markdown (*.md);;Text (*.txt);;All (*.*)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Importar .md", str(Path.home()), "Markdown (*.md);;Text (*.txt);;All (*.*)")
         if not path:
             return
         try:
@@ -363,51 +431,142 @@ class KnowledgePage(QtWidgets.QWidget):
             cono_md, rol_md = split_sections(data)
             self.cono_edit.setPlainText(cono_md)
             self.rol_edit.setPlainText(rol_md)
-            self.log_signal.emit(f"Knowledge imported from {path}")
+            self.log_signal.emit(f"Importado: {path}")
         except Exception as e:
-            self.log_signal.emit(f"[ERROR] Import: {e}")
-            QtWidgets.QMessageBox.critical(self, "Error", f"Cannot import: {e}")
+            self.log_signal.emit(f"[ERROR] Importar: {e}")
+            QtWidgets.QMessageBox.critical(self, "Error", f"No se pudo importar: {e}")
 
 class ComposePage(QtWidgets.QWidget):
     log_signal = QtCore.Signal(str)
+    paste_transcript = QtCore.Signal(str)
 
     def __init__(self, cfg: AppConfig):
         super().__init__()
         self.cfg = cfg
 
-        v = QtWidgets.QVBoxLayout(self)
+        layout = QtWidgets.QVBoxLayout(self)
 
-        # Input
-        in_group = QtWidgets.QGroupBox("Paste a call snippet or summary")
+        # Subpestañas (dos modos)
+        self.modes = QtWidgets.QTabWidget()
+        layout.addWidget(self.modes)
+
+        # --- Modo 1: Escuchar PC (beta) ---
+        self._build_listen_tab()
+
+        # --- Modo 2: Escribir ---
+        self._build_write_tab()
+
+    # ====== Escuchar PC (beta) ======
+    def _build_listen_tab(self):
+        tab = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(tab)
+
+        info = QtWidgets.QLabel("Graba audio del sistema (WASAPI loopback) o micrófono si no está disponible.\n"
+                                "Luego se transcribe con Whisper.")
+        info.setWordWrap(True)
+        v.addWidget(info)
+
+        # Controles
+        form = QtWidgets.QHBoxLayout()
+        self.seconds_sb = QtWidgets.QSpinBox()
+        self.seconds_sb.setRange(3, 120)
+        self.seconds_sb.setValue(15)
+        form.addWidget(QtWidgets.QLabel("Duración (s):"))
+        form.addWidget(self.seconds_sb)
+
+        self.btn_record = QtWidgets.QPushButton("Grabar y transcribir")
+        form.addWidget(self.btn_record)
+        form.addStretch(1)
+        v.addLayout(form)
+
+        # Resultado de transcripción
+        self.transcript = QtWidgets.QPlainTextEdit()
+        self.transcript.setPlaceholderText("Transcripción…")
+        v.addWidget(self.transcript, 2)
+
+        # Botones aplicar/enviar
+        hb = QtWidgets.QHBoxLayout()
+        self.btn_to_writer = QtWidgets.QPushButton("Pegar en 'Escribir'")
+        hb.addWidget(self.btn_to_writer)
+        hb.addStretch(1)
+        v.addLayout(hb)
+
+        self.modes.addTab(tab, "Escuchar PC (beta)")
+
+        # Signals
+        self.btn_record.clicked.connect(self._on_record_transcribe)
+        self.btn_to_writer.clicked.connect(lambda: self.paste_transcript.emit(self.transcript.toPlainText().strip()))
+
+    def _on_record_transcribe(self):
+        secs = int(self.seconds_sb.value())
+        self.transcript.setPlainText("Grabando/transcribiendo…")
+
+        api_key = load_api_key(False) or load_api_key(True)
+        if not api_key:
+            QtWidgets.QMessageBox.warning(self, "API Key", "Configura tu API key en Settings.")
+            self.transcript.setPlainText("")
+            return
+        try:
+            client = make_client(api_key)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", str(e))
+            self.transcript.setPlainText("")
+            return
+
+        def worker():
+            try:
+                wav_path = record_system_or_mic_wav(secs, logs=lambda m: self.log_signal.emit(m))
+                text = transcribe_file(client, self.cfg.transcribe_model, wav_path)
+                self.transcript.setPlainText(text)
+                self.log_signal.emit("Transcripción lista.")
+            except Exception as e:
+                self.transcript.setPlainText(f"[ERROR] {e}")
+                self.log_signal.emit(f"[ERROR] {e}")
+
+        QtCore.QThreadPool.globalInstance().start(_Runnable(worker))
+
+    # ====== Escribir ======
+    def _build_write_tab(self):
+        tab = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(tab)
+
+        in_group = QtWidgets.QGroupBox("Escribe o pega un fragmento / resumen de la llamada")
         in_layout = QtWidgets.QVBoxLayout(in_group)
         self.input = QtWidgets.QPlainTextEdit()
         in_layout.addWidget(self.input)
         v.addWidget(in_group, 2)
 
-        # Buttons
         hb = QtWidgets.QHBoxLayout()
-        self.btn_suggest = QtWidgets.QPushButton("Suggest reply (EN)")
-        self.btn_clear = QtWidgets.QPushButton("Clear")
+        self.btn_suggest = QtWidgets.QPushButton("Sugerir respuesta (inglés)")
+        self.btn_clear = QtWidgets.QPushButton("Limpiar")
         hb.addWidget(self.btn_suggest); hb.addWidget(self.btn_clear); hb.addStretch(1)
         v.addLayout(hb)
 
-        # Output
-        out_group = QtWidgets.QGroupBox("Suggested reply")
+        out_group = QtWidgets.QGroupBox("Respuesta sugerida")
         out_layout = QtWidgets.QVBoxLayout(out_group)
         self.output = QtWidgets.QPlainTextEdit(); self.output.setReadOnly(True)
         out_layout.addWidget(self.output)
         v.addWidget(out_group, 2)
 
-        self.btn_suggest.clicked.connect(self._on_suggest)
+        self.modes.addTab(tab, "Escribir")
+
+        # Conectar señales
         self.btn_clear.clicked.connect(lambda: self.input.setPlainText(""))
+        self.btn_suggest.clicked.connect(self._on_suggest)
+        self.paste_transcript.connect(lambda t: self._paste_into_writer(t))
+
+    def _paste_into_writer(self, text: str):
+        self.modes.setCurrentIndex(1)  # Cambiar a "Escribir"
+        if text:
+            self.input.setPlainText(text)
 
     def _on_suggest(self):
         text = self.input.toPlainText().strip()
         if not text:
-            QtWidgets.QMessageBox.information(self, "Empty", "Paste some text first.")
+            QtWidgets.QMessageBox.information(self, "Vacío", "Escribe o pega algo primero.")
             return
 
-        api_key = load_api_key(self.cfg.use_encryption)
+        api_key = load_api_key(False) or load_api_key(True)
         try:
             client = make_client(api_key)
         except Exception as e:
@@ -416,13 +575,13 @@ class ComposePage(QtWidgets.QWidget):
             return
 
         prompt = build_prompt(text)
-        self.output.setPlainText("Generating…")
+        self.output.setPlainText("Generando…")
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         QtWidgets.QApplication.processEvents()
         try:
             reply = ask_model(client, self.cfg.chat_model, prompt)
             self.output.setPlainText(reply)
-            self.log_signal.emit("Suggestion generated.")
+            self.log_signal.emit("Sugerencia generada.")
         except Exception as e:
             self.output.setPlainText(f"[ERROR] {e}")
             self.log_signal.emit(f"[ERROR] {e}")
@@ -443,6 +602,14 @@ class LogsPage(QtWidgets.QWidget):
         self.box.appendPlainText(f"[{ts}] {msg}")
         self.box.verticalScrollBar().setValue(self.box.verticalScrollBar().maximum())
 
+# Helper para ejecutar funciones en ThreadPool
+class _Runnable(QtCore.QRunnable):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+    def run(self):
+        self.fn()
+
 # ------------------------
 # Main Window
 # ------------------------
@@ -459,15 +626,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(tabs)
 
         # Pages
+        self.compose  = ComposePage(self.cfg)
         self.settings = SettingsPage(self.cfg)
         self.knowledge = KnowledgePage()
-        self.compose  = ComposePage(self.cfg)
         self.logs     = LogsPage()
 
+        # Orden: COMPOSE primero (por defecto)
+        tabs.addTab(self.compose, "Compose")
         tabs.addTab(self.settings, "Settings")
         tabs.addTab(self.knowledge, "Knowledge")
-        tabs.addTab(self.compose, "Compose")
         tabs.addTab(self.logs, "Logs")
+        tabs.setCurrentWidget(self.compose)  # pestaña por defecto
 
         # Wiring logs
         self.settings.log_signal.connect(self.logs.append)
@@ -485,15 +654,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_status(self):
         try:
             mtime = datetime.fromtimestamp(KNOWLEDGE_PATH.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-            self.status.showMessage(f"Knowledge: {KNOWLEDGE_PATH} | Updated: {mtime}")
+            self.status.showMessage(f"Conocimientos: {KNOWLEDGE_PATH} | Actualizado: {mtime}")
         except Exception:
-            self.status.showMessage(f"Knowledge: {KNOWLEDGE_PATH}")
+            self.status.showMessage(f"Conocimientos: {KNOWLEDGE_PATH}")
 
 def main():
     app = QtWidgets.QApplication([])
     app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api='pyside6'))
 
-    # Icono (opcional): busca assets/icon.ico si lo agregas en el futuro
+    # Icono (opcional futuro): assets/icon.ico
     icon_path = resource_path('assets/icon.ico')
     if icon_path.exists():
         app.setWindowIcon(QtGui.QIcon(str(icon_path)))
@@ -504,5 +673,6 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
