@@ -6,8 +6,8 @@ CallCenter Helper – Qt + QDarkStyle (Whisper + GPT)
 - UI: PySide6 + QDarkStyle (oscuro).
 - Settings: guarda/lee API Key (cifrado local opcional).
 - Knowledge: editor con 2 pestañas ("Conocimientos" y "Rol") sobre un único conocimientos.md.
-- Compose (ES): "Escuchar PC" continuo (▶️/⏸️), transcribe en bucles; "🧠 Generar respuesta" usa SOLO lo nuevo
-  desde el último clic y mantiene memoria; "🆕 Nueva conversación" reinicia hilo y crea archivo .txt.
+- Compose (ES): "Escuchar PC" continuo (▶️/⏸️), transcribe en bucles; "🧠 Generar respuesta" usa SOLO lo
+  nuevo desde el último clic y mantiene memoria; "🆕 Nueva conversación" reinicia hilo y crea archivo .txt.
 - Logs: pestaña para ver eventos y errores.
 - Historial: %APPDATA%/CallCenterHelper/historial/ conv_YYYYmmdd_HHMMSS.txt (transcripción + respuestas).
 - Build: PyInstaller --onedir --windowed (sin consola). Incluye conocimientos.md como recurso.
@@ -21,7 +21,6 @@ import json
 import os
 import re
 import sys
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -66,7 +65,7 @@ ORG = "GG"
 APP_DIR = Path(user_data_dir(APP_NAME, ORG))
 APP_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = APP_DIR / "config.json"
-API_KEY_PATH = APP_DIR / "api.key.enc"   # siempre usamos esta ruta, cifrado opcional
+API_KEY_PATH = APP_DIR / "api.key.enc"   # siempre esta ruta; si hay cifrado o no, lo auto-detectamos
 FERNET_KEY_PATH = APP_DIR / ".fernet.key"
 KNOWLEDGE_PATH = APP_DIR / "conocimientos.md"
 HISTORY_DIR = APP_DIR / "historial"
@@ -176,7 +175,7 @@ def _ensure_fernet() -> Fernet | None:
     return Fernet(FERNET_KEY_PATH.read_bytes())
 
 def _looks_like_fernet_token(s: str) -> bool:
-    # Heurística: tokens Fernet suelen empezar con 'gAAAA' y ser base64 largo
+    # Heurística simple: tokens Fernet suelen empezar con 'gAAAA' y ser base64 largo
     return bool(re.match(r'^gAAAA[A-Za-z0-9_\-]+=*', s.strip()))
 
 def save_api_key(api_key: str, use_encryption: bool):
@@ -208,8 +207,6 @@ def load_api_key_auto() -> str | None:
             f = _ensure_fernet()
             return f.decrypt(raw.encode("utf-8")).decode("utf-8")
         except InvalidToken:
-            # Token parece Fernet pero no se puede descifrar (clave distinta)
-            # Devuelve None para forzar re-guardado por el usuario.
             return None
         except Exception:
             return None
@@ -268,35 +265,54 @@ def record_chunk_wav(seconds: int = 8, samplerate: int = 48000, channels: int = 
 
     # 1) Loopback con soundcard (preferido)
     if sc is not None:
+        mic = None
         try:
             spk = sc.default_speaker()
-            # include_loopback=True permite capturar lo que suena en los altavoces
-            with spk.recorder(samplerate=samplerate, channels=channels) as rec:
-                if logs: logs("Grabando altavoces (loopback, soundcard)…")
-                data = rec.record(numframes=int(seconds * samplerate))
-            # Guardar WAV (usar soundfile si está; si no, fallback a wave)
-            if sf is not None:
-                sf.write(out.as_posix(), data, samplerate)
-            else:
-                import wave
-                import numpy as np
-                if data.dtype != np.int16:
-                    # normaliza a int16
-                    data16 = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
-                else:
-                    data16 = data
-                with wave.open(out.as_posix(), 'wb') as wf:
-                    wf.setnchannels(data16.shape[1] if data16.ndim > 1 else 1)
-                    wf.setsampwidth(2)  # int16
-                    wf.setframerate(samplerate)
-                    wf.writeframes(data16.tobytes())
-            return out
-        except Exception as e:
-            if logs: logs(f"Loopback (soundcard) falló: {e}")
+            mic = sc.get_microphone(spk.name, include_loopback=True)
+        except Exception:
+            mic = None
 
-    # 2) Fallback micrófono con sounddevice
-    if sd is None or sf is None or np is None:
-        raise RuntimeError("No se pudo capturar audio del PC y falta 'sounddevice/soundfile/numpy' para fallback.")
+        # Si no encontró por nombre de altavoz, intenta cualquier loopback
+        if mic is None:
+            try:
+                loopbacks = [m for m in sc.all_microphones(include_loopback=True) if getattr(m, "isloopback", False)]
+                if logs:
+                    names = ", ".join(m.name for m in loopbacks)
+                    logs(f"Loopbacks disponibles: {names or '(ninguno)'}")
+                mic = loopbacks[0] if loopbacks else None
+            except Exception as e:
+                if logs: logs(f"No se pudo listar loopbacks: {e}")
+                mic = None
+
+        if mic is not None:
+            try:
+                if logs: logs(f"Grabando altavoces (loopback) con '{mic.name}'…")
+                with mic.recorder(samplerate=samplerate) as rec:
+                    data = rec.record(numframes=int(seconds * samplerate))  # (frames, channels)
+                # Guardar WAV
+                if sf is not None:
+                    sf.write(out.as_posix(), data, samplerate)
+                else:
+                    import wave, numpy as _np
+                    if data.dtype != _np.int16:
+                        data16 = (_np.clip(data, -1.0, 1.0) * 32767).astype(_np.int16)
+                    else:
+                        data16 = data
+                    with wave.open(out.as_posix(), "wb") as wf:
+                        ch = data16.shape[1] if data16.ndim > 1 else 1
+                        wf.setnchannels(ch)
+                        wf.setsampwidth(2)
+                        wf.setframerate(samplerate)
+                        wf.writeframes(data16.tobytes())
+                return out
+            except Exception as e:
+                if logs: logs(f"Loopback (soundcard) falló: {e}")
+
+    # 2) Fallback micrófono con sounddevice (solo si el loopback falla)
+    if sd is None or sf is None:
+        raise RuntimeError(
+            "No se pudo capturar audio del PC (loopback) y falta 'sounddevice/soundfile' para el fallback de micrófono."
+        )
 
     if logs: logs("Grabando micrófono (fallback)…")
     rec = sd.rec(int(seconds * samplerate), samplerate=samplerate, channels=1, dtype="float32")
@@ -675,6 +691,7 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 
