@@ -24,6 +24,7 @@ jobs:
           pip install pyinstaller
 
       - name: Build (onedir, windowed, include conocimientos.md)
+        shell: cmd
         run: |
           pyinstaller --noconfirm --onedir --windowed --name CallCenterHelper ^
             --collect-all PySide6 ^
