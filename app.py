@@ -8,7 +8,7 @@ CallCenter Helper – Qt + QDarkStyle (Whisper + GPT)
 - Knowledge: editor con 2 pestañas ("Conocimientos" y "Rol") sobre un único conocimientos.md.
 - Compose (ES): "Escuchar PC" continuo (▶️/⏸️), transcribe en bucles; "🧠 Generar respuesta" usa SOLO lo
   nuevo desde el último clic y mantiene memoria; "🆕 Nueva conversación" reinicia hilo y crea archivo .txt.
-- Logs: pestaña para ver eventos y errores.
+- Logs: pestaña para ver eventos y errores (ahora MUY detallados).
 - Historial: %APPDATA%/CallCenterHelper/historial/ conv_YYYYmmdd_HHMMSS.txt (transcripción + respuestas).
 - Build: PyInstaller --onedir --windowed (sin consola). Incluye conocimientos.md como recurso.
 
@@ -247,15 +247,33 @@ def ask_model(client: OpenAI, model: str, prompt: str) -> str:
     except Exception:
         return getattr(resp, "output_text", "(no text)").strip()
 
-def transcribe_file(client: OpenAI, model: str, file_path: Path) -> str:
+def transcribe_file(client: OpenAI, model: str, file_path: Path, logs=None) -> str:
+    if logs: logs(f"Enviando a Whisper: {file_path.name}")
     with open(file_path, "rb") as f:
-        tr = client.audio.transcriptions.create(model=model, file=f)
-    return getattr(tr, "text", "") or json.dumps(getattr(tr, "__dict__", {}), ensure_ascii=False)
+        tr = client.audio.transcriptions.create(
+            model=model,
+            file=f,
+            # Forzamos traducción a inglés aunque el audio esté en ES:
+            translate=True,
+            response_format="json"  # más robusto si el SDK lo soporta
+        )
+    text = getattr(tr, "text", "") or json.dumps(getattr(tr, "__dict__", {}), ensure_ascii=False)
+    if logs: logs(f"Texto recibido: {text[:120]}{'...' if len(text)>120 else ''}")
+    return text
 
 # ------------------------
 # Audio helpers (PC loopback con soundcard)
 # ------------------------
-def record_chunk_wav(seconds: int = 8, samplerate: int = 48000, channels: int = 2, logs=None) -> Path:
+def _to_mono_float32(data) -> "np.ndarray":
+    """Convierte (frames,) o (frames,channels) a mono float32 [-1..1]."""
+    if np is None:
+        return data
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim == 2 and arr.shape[1] > 1:
+        arr = arr.mean(axis=1)
+    return arr.astype(np.float32, copy=False)
+
+def record_chunk_wav(seconds: int = 12, samplerate: int = 44100, channels: int = 2, logs=None) -> Path:
     """
     Captura un chunk WAV del AUDIO DEL PC (altavoces) usando soundcard (loopback).
     Si soundcard no está disponible o falla, cae a micrófono (sounddevice).
@@ -288,22 +306,23 @@ def record_chunk_wav(seconds: int = 8, samplerate: int = 48000, channels: int = 
             try:
                 if logs: logs(f"Grabando altavoces (loopback) con '{mic.name}'…")
                 with mic.recorder(samplerate=samplerate) as rec:
-                    data = rec.record(numframes=int(seconds * samplerate))  # (frames, channels)
+                    data = rec.record(numframes=int(seconds * samplerate))  # (frames, channels?) float
+                if logs and hasattr(data, "shape"): logs(f"Chunk capturado shape={getattr(data,'shape',None)}")
+                # A mono
+                data_mono = _to_mono_float32(data)
                 # Guardar WAV
                 if sf is not None:
-                    sf.write(out.as_posix(), data, samplerate)
+                    sf.write(out.as_posix(), data_mono, samplerate)
                 else:
-                    import wave, numpy as _np
-                    if data.dtype != _np.int16:
-                        data16 = (_np.clip(data, -1.0, 1.0) * 32767).astype(_np.int16)
-                    else:
-                        data16 = data
+                    import wave
+                    import numpy as _np
+                    data16 = (_np.clip(data_mono, -1.0, 1.0) * 32767).astype(_np.int16)
                     with wave.open(out.as_posix(), "wb") as wf:
-                        ch = data16.shape[1] if data16.ndim > 1 else 1
-                        wf.setnchannels(ch)
+                        wf.setnchannels(1)
                         wf.setsampwidth(2)
                         wf.setframerate(samplerate)
                         wf.writeframes(data16.tobytes())
+                if logs: logs(f"WAV escrito: {out.name} ({out.stat().st_size} bytes)")
                 return out
             except Exception as e:
                 if logs: logs(f"Loopback (soundcard) falló: {e}")
@@ -318,6 +337,7 @@ def record_chunk_wav(seconds: int = 8, samplerate: int = 48000, channels: int = 
     rec = sd.rec(int(seconds * samplerate), samplerate=samplerate, channels=1, dtype="float32")
     sd.wait()
     sf.write(out.as_posix(), rec, samplerate)
+    if logs: logs(f"WAV escrito (mic): {out.name} ({out.stat().st_size} bytes)")
     return out
 
 # ------------------------
@@ -455,7 +475,11 @@ class KnowledgePage(QtWidgets.QWidget):
 
 class ListenWorker(QtCore.QThread):
     """Hilo que graba en bucles y emite transcripciones incrementales."""
-    chunk_seconds = 8
+    # Ajustes más compatibles
+    chunk_seconds = 12
+    samplerate = 44100
+    channels = 2
+
     new_text = QtCore.Signal(str)
     log = QtCore.Signal(str)
 
@@ -474,14 +498,24 @@ class ListenWorker(QtCore.QThread):
             return
         while self._running:
             try:
-                wav = record_chunk_wav(self.chunk_seconds, logs=lambda m: self.log.emit(m))
-                text = transcribe_file(client, self.stt_model, wav).strip()
+                wav = record_chunk_wav(self.chunk_seconds, self.samplerate, self.channels, logs=lambda m: self.log.emit(m))
+                # Si el archivo quedó demasiado pequeño, lo consideramos silencio
+                try:
+                    size = wav.stat().st_size
+                except Exception:
+                    size = 0
+                if size < 5000:  # ~WAV mínimo
+                    self.log.emit("(silencio)")
+                else:
+                    text = transcribe_file(client, self.stt_model, wav, logs=lambda m: self.log.emit(m)).strip()
+                    if text:
+                        self.new_text.emit(text)
+                    else:
+                        self.log.emit("(Whisper no devolvió texto)")
                 try:
                     wav.unlink(missing_ok=True)
                 except Exception:
                     pass
-                if text:
-                    self.new_text.emit(text)
             except Exception as e:
                 self.log.emit(f"[ERROR] Transcripción: {e}")
             # se repite inmediatamente (chunk_seconds marca el ritmo)
@@ -691,6 +725,7 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 
