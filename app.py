@@ -6,8 +6,8 @@ CallCenter Helper – Qt + QDarkStyle (Whisper + GPT)
 - UI: PySide6 + QDarkStyle (oscuro).
 - Settings: guarda/lee API Key (cifrado local opcional).
 - Knowledge: editor con 2 pestañas ("Conocimientos" y "Rol") sobre un único conocimientos.md.
-- Compose (ES): "Escuchar PC" continuo con ▶️/⏸️, "🧠 Generar respuesta" usa SOLO lo nuevo desde
-  el último clic y mantiene memoria; "🆕 Nueva conversación" reinicia hilo.
+- Compose (ES): "Escuchar PC" continuo (▶️/⏸️), transcribe en bucles; "🧠 Generar respuesta" usa SOLO lo nuevo
+  desde el último clic y mantiene memoria; "🆕 Nueva conversación" reinicia hilo y crea archivo .txt.
 - Logs: pestaña para ver eventos y errores.
 - Historial: %APPDATA%/CallCenterHelper/historial/ conv_YYYYmmdd_HHMMSS.txt (transcripción + respuestas).
 - Build: PyInstaller --onedir --windowed (sin consola). Incluye conocimientos.md como recurso.
@@ -30,18 +30,24 @@ from appdirs import user_data_dir
 from PySide6 import QtCore, QtGui, QtWidgets
 import qdarkstyle
 
-# --- Dependencias opcionales ---
+# --- Dependencias externas ---
 try:
-    from cryptography.fernet import Fernet
+    from cryptography.fernet import Fernet, InvalidToken
 except Exception:
     Fernet = None
+    InvalidToken = Exception
 
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
-# Audio
+# Audio: loopback de altavoces (soundcard) + fallback mic (sounddevice)
+try:
+    import soundcard as sc
+except Exception:
+    sc = None
+
 try:
     import sounddevice as sd
     import soundfile as sf
@@ -60,7 +66,7 @@ ORG = "GG"
 APP_DIR = Path(user_data_dir(APP_NAME, ORG))
 APP_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = APP_DIR / "config.json"
-API_KEY_PATH = APP_DIR / "api.key.enc"
+API_KEY_PATH = APP_DIR / "api.key.enc"   # siempre usamos esta ruta, cifrado opcional
 FERNET_KEY_PATH = APP_DIR / ".fernet.key"
 KNOWLEDGE_PATH = APP_DIR / "conocimientos.md"
 HISTORY_DIR = APP_DIR / "historial"
@@ -106,12 +112,9 @@ def _find_h1_positions(md: str) -> list[tuple[int, str]]:
 def split_sections(md: str) -> tuple[str, str]:
     text = md.replace("\r\n", "\n")
     headers = _find_h1_positions(text)
+
     def norm(s: str) -> str:
         return re.sub(r'\s+', ' ', s.strip().lower())
-
-    idx = {norm(h): pos for pos, h in headers}
-    n_cono = norm(H1_CONO)
-    n_rol  = norm(H1_ROL)
 
     def extract(start_pos: int) -> str:
         starts = sorted([p for p, _ in headers])
@@ -119,10 +122,12 @@ def split_sections(md: str) -> tuple[str, str]:
         end = nexts[0] if nexts else len(text)
         return text[start_pos:end].strip() + "\n"
 
-    pos_cono = None; pos_rol = None
+    # Buscar posiciones de los dos H1 (tolerante a espacios/case)
+    pos_cono = pos_rol = None
     for pos, h in headers:
-        if norm(h) == n_cono: pos_cono = pos
-        if norm(h) == n_rol:  pos_rol  = pos
+        nh = norm(h)
+        if nh == norm(H1_CONO): pos_cono = pos
+        if nh == norm(H1_ROL):  pos_rol  = pos
 
     if pos_cono is None and pos_rol is None:
         return (f"{H1_CONO}\n\n{text.strip()}\n", f"{H1_ROL}\n\n")
@@ -146,7 +151,7 @@ def merge_sections(cono_md: str, rol_md: str) -> str:
 class AppConfig:
     chat_model: str = "gpt-3.5-turbo"   # DEFAULT ECONÓMICO
     transcribe_model: str = "whisper-1"
-    use_encryption: bool = False
+    use_encryption: bool = False        # preferencia UI; lectura es auto-detectada
 
     @staticmethod
     def load() -> "AppConfig":
@@ -170,6 +175,10 @@ def _ensure_fernet() -> Fernet | None:
         FERNET_KEY_PATH.write_bytes(Fernet.generate_key())
     return Fernet(FERNET_KEY_PATH.read_bytes())
 
+def _looks_like_fernet_token(s: str) -> bool:
+    # Heurística: tokens Fernet suelen empezar con 'gAAAA' y ser base64 largo
+    return bool(re.match(r'^gAAAA[A-Za-z0-9_\-]+=*', s.strip()))
+
 def save_api_key(api_key: str, use_encryption: bool):
     if not api_key:
         raise ValueError("API key vacía")
@@ -179,16 +188,33 @@ def save_api_key(api_key: str, use_encryption: bool):
     else:
         API_KEY_PATH.write_text(api_key, encoding="utf-8")
 
-def load_api_key(use_encryption: bool) -> str | None:
+def load_api_key_auto() -> str | None:
+    """
+    Lee API key y, si detecta que el archivo contiene un token Fernet,
+    intenta descifrarlo automáticamente aunque la preferencia esté apagada.
+    """
     if not API_KEY_PATH.exists():
         return None
     try:
-        if use_encryption and Fernet:
-            f = _ensure_fernet()
-            return f.decrypt(API_KEY_PATH.read_bytes()).decode("utf-8")
-        return API_KEY_PATH.read_text(encoding="utf-8").strip()
+        raw = API_KEY_PATH.read_text(encoding="utf-8").strip()
     except Exception:
         return None
+
+    if not raw:
+        return None
+
+    if _looks_like_fernet_token(raw) and Fernet:
+        try:
+            f = _ensure_fernet()
+            return f.decrypt(raw.encode("utf-8")).decode("utf-8")
+        except InvalidToken:
+            # Token parece Fernet pero no se puede descifrar (clave distinta)
+            # Devuelve None para forzar re-guardado por el usuario.
+            return None
+        except Exception:
+            return None
+    else:
+        return raw
 
 # ------------------------
 # OpenAI
@@ -230,43 +256,53 @@ def transcribe_file(client: OpenAI, model: str, file_path: Path) -> str:
     return getattr(tr, "text", "") or json.dumps(getattr(tr, "__dict__", {}), ensure_ascii=False)
 
 # ------------------------
-# Audio helpers
+# Audio helpers (PC loopback con soundcard)
 # ------------------------
 def record_chunk_wav(seconds: int = 8, samplerate: int = 48000, channels: int = 2, logs=None) -> Path:
     """
-    Captura un chunk WAV:
-      - Intenta WASAPI loopback (audio del sistema) en Windows.
-      - Si falla, cae a micrófono.
-    Devuelve ruta al WAV temporal.
+    Captura un chunk WAV del AUDIO DEL PC (altavoces) usando soundcard (loopback).
+    Si soundcard no está disponible o falla, cae a micrófono (sounddevice).
+    Devuelve ruta al WAV en carpeta de la app.
     """
+    out = APP_DIR / f"chunk_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.wav"
+
+    # 1) Loopback con soundcard (preferido)
+    if sc is not None:
+        try:
+            spk = sc.default_speaker()
+            # include_loopback=True permite capturar lo que suena en los altavoces
+            with spk.recorder(samplerate=samplerate, channels=channels) as rec:
+                if logs: logs("Grabando altavoces (loopback, soundcard)…")
+                data = rec.record(numframes=int(seconds * samplerate))
+            # Guardar WAV (usar soundfile si está; si no, fallback a wave)
+            if sf is not None:
+                sf.write(out.as_posix(), data, samplerate)
+            else:
+                import wave
+                import numpy as np
+                if data.dtype != np.int16:
+                    # normaliza a int16
+                    data16 = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
+                else:
+                    data16 = data
+                with wave.open(out.as_posix(), 'wb') as wf:
+                    wf.setnchannels(data16.shape[1] if data16.ndim > 1 else 1)
+                    wf.setsampwidth(2)  # int16
+                    wf.setframerate(samplerate)
+                    wf.writeframes(data16.tobytes())
+            return out
+        except Exception as e:
+            if logs: logs(f"Loopback (soundcard) falló: {e}")
+
+    # 2) Fallback micrófono con sounddevice
     if sd is None or sf is None or np is None:
-        raise RuntimeError("Falta instalar 'sounddevice', 'soundfile' y 'numpy'.")
+        raise RuntimeError("No se pudo capturar audio del PC y falta 'sounddevice/soundfile/numpy' para fallback.")
 
-    tmp = Path(APP_DIR) / f"chunk_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.wav"
-
-    try:
-        wasapi = sd.WasapiSettings(loopback=True)
-        if logs: logs("Grabando (loopback)…")
-        buf = []
-
-        def cb(indata, frames, time_info, status):
-            if status and logs: logs(f"sd status: {status}")
-            buf.append(indata.copy())
-
-        with sd.InputStream(samplerate=samplerate, channels=channels, dtype="float32",
-                            extra_settings=wasapi, callback=cb):
-            sd.sleep(int(seconds * 1000))
-
-        data = np.concatenate(buf, axis=0) if buf else np.zeros((samplerate*seconds, channels), dtype="float32")
-        sf.write(tmp.as_posix(), data, samplerate)
-        return tmp
-
-    except Exception as e:
-        if logs: logs(f"Loopback no disponible ({e}). Grabando micrófono…")
-        rec = sd.rec(int(seconds * samplerate), samplerate=samplerate, channels=1, dtype="float32")
-        sd.wait()
-        sf.write(tmp.as_posix(), rec, samplerate)
-        return tmp
+    if logs: logs("Grabando micrófono (fallback)…")
+    rec = sd.rec(int(seconds * samplerate), samplerate=samplerate, channels=1, dtype="float32")
+    sd.wait()
+    sf.write(out.as_posix(), rec, samplerate)
+    return out
 
 # ------------------------
 # UI – Pages
@@ -282,7 +318,8 @@ class SettingsPage(QtWidgets.QWidget):
 
         self.api_edit = QtWidgets.QLineEdit()
         self.api_edit.setEchoMode(QtWidgets.QLineEdit.Password)
-        if load_api_key(self.cfg.use_encryption):
+        # Placeholder si ya hay key guardada (cifrada o no)
+        if load_api_key_auto():
             self.api_edit.setPlaceholderText("*** guardada ***")
 
         self.show_chk = QtWidgets.QCheckBox("Mostrar")
@@ -428,11 +465,10 @@ class ListenWorker(QtCore.QThread):
                 except Exception:
                     pass
                 if text:
-                    # Nota: Pediste transcripción en inglés → asumimos Whisper entrega EN (o traduce con modelo si aplica)
                     self.new_text.emit(text)
             except Exception as e:
                 self.log.emit(f"[ERROR] Transcripción: {e}")
-            # sin sleep adicional; el chunk_seconds marca el ritmo
+            # se repite inmediatamente (chunk_seconds marca el ritmo)
 
     def stop(self):
         self._running = False
@@ -448,14 +484,13 @@ class ComposePage(QtWidgets.QWidget):
         self.worker: ListenWorker | None = None
 
         self.conversation_file: Path | None = None
-        self._ensure_new_conversation()  # arranca con un archivo
+        self._ensure_new_conversation()
 
-        # Puntero de "desde dónde" generar la siguiente respuesta
         self.last_processed_len = 0
 
         v = QtWidgets.QVBoxLayout(self)
 
-        # Controles principales (ES)
+        # Botones principales
         hb = QtWidgets.QHBoxLayout()
         self.btn_listen = QtWidgets.QPushButton("▶️ Empezar a escuchar")
         self.btn_generate = QtWidgets.QPushButton("🧠 Generar respuesta")
@@ -494,10 +529,9 @@ class ComposePage(QtWidgets.QWidget):
             with self.conversation_file.open("a", encoding="utf-8") as f:
                 f.write(text)
 
-    # ---- Escuchar PC ----
+    # ---- Escuchar PC (toggle) ----
     def _toggle_listen(self):
         if self.listening:
-            # Stop
             if self.worker:
                 self.worker.stop()
                 self.worker.wait(2000)
@@ -506,8 +540,7 @@ class ComposePage(QtWidgets.QWidget):
             self.btn_listen.setText("▶️ Empezar a escuchar")
             self.log_signal.emit("Escucha detenida.")
         else:
-            # Start
-            api_key = load_api_key(False) or load_api_key(True)
+            api_key = load_api_key_auto()
             if not api_key:
                 QtWidgets.QMessageBox.warning(self, "API Key", "Configura tu API key en Settings.")
                 return
@@ -521,14 +554,13 @@ class ComposePage(QtWidgets.QWidget):
 
     @QtCore.Slot(str)
     def _on_new_transcript(self, text: str):
-        # Agrega con salto y guarda a historial
         if self.transcript.toPlainText():
             self.transcript.appendPlainText("\n" + text)
         else:
             self.transcript.setPlainText(text)
         self._append_history(f"[WHISPER] {text}\n")
 
-    # ---- Generar respuesta ----
+    # ---- Generar respuesta (solo delta) ----
     def _generate_reply(self):
         full = self.transcript.toPlainText()
         new_segment = full[self.last_processed_len:].strip()
@@ -536,7 +568,7 @@ class ComposePage(QtWidgets.QWidget):
             QtWidgets.QMessageBox.information(self, "Sin cambios", "No hay nuevo contenido desde la última respuesta.")
             return
 
-        api_key = load_api_key(False) or load_api_key(True)
+        api_key = load_api_key_auto()
         try:
             client = make_client(api_key)
         except Exception as e:
@@ -544,10 +576,8 @@ class ComposePage(QtWidgets.QWidget):
             QtWidgets.QMessageBox.critical(self, "Error", str(e))
             return
 
-        # Prompt con KNOWLEDGE + solo el tramo nuevo, pero le damos contexto corto previo
-        # (últimos 800 caracteres) para mantener un poco de hilo
         context_tail = full[max(0, self.last_processed_len - 800):self.last_processed_len]
-        prompt = build_prompt(context_tail + "\n" + new_segment)
+        prompt = build_prompt(context_tail + ("\n" if context_tail else "") + new_segment)
         self.output.setPlainText("Generating…")
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         QtWidgets.QApplication.processEvents()
@@ -555,7 +585,6 @@ class ComposePage(QtWidgets.QWidget):
             reply = ask_model(client, self.cfg.chat_model, prompt)
             self.output.setPlainText(reply)
             self.last_processed_len = len(full)
-            # Guardar a historial
             self._append_history(f"[GPT] {reply}\n")
             self.log_signal.emit("Respuesta generada.")
         except Exception as e:
@@ -566,7 +595,6 @@ class ComposePage(QtWidgets.QWidget):
 
     # ---- Nueva conversación ----
     def _new_conversation(self):
-        # Detener escucha si está activa
         if self.listening:
             self._toggle_listen()
         self.transcript.setPlainText("")
@@ -615,7 +643,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self.logs, "Logs")
         tabs.setCurrentWidget(self.compose)
 
-        # Wiring logs
+        # Logs wiring
         self.settings.log_signal.connect(self.logs.append)
         self.knowledge.log_signal.connect(self.logs.append)
         self.compose.log_signal.connect(self.logs.append)
@@ -647,6 +675,7 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 
