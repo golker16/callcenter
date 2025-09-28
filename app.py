@@ -4,9 +4,9 @@ CallCenter Helper – Qt + QDarkStyle (Whisper + GPT)
 ---------------------------------------------------
 - Modelo por defecto: gpt-3.5-turbo (bajo costo).
 - UI: PySide6 + QDarkStyle (oscuro).
-- Settings: guarda/lee API Key (cifrado local opcional).
+- Settings: guarda/lee API Key de D:\Desktop\main_api_key.txt (sin opciones extra).
 - Knowledge: editor con 2 pestañas ("Conocimientos" y "Rol") sobre un único conocimientos.md.
-- Compose (ES): "Escuchar PC" continuo (▶️/⏸️), transcribe en bucles; "🧠 Generar respuesta" usa SOLO lo
+- Compose (ES): "Escuchar PC" continuo (▶️/⏸️), transcribe en bucles de ~2 s; "🧠 Generar respuesta" usa SOLO lo
   nuevo desde el último clic y mantiene memoria; "🆕 Nueva conversación" reinicia hilo y crea archivo .txt.
 - Logs: pestaña para ver eventos y errores (detallados).
 - Historial: %APPDATA%/CallCenterHelper/historial/ conv_YYYYmmdd_HHMMSS.txt (transcripción + respuestas).
@@ -30,12 +30,6 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import qdarkstyle
 
 # --- Dependencias externas ---
-try:
-    from cryptography.fernet import Fernet, InvalidToken
-except Exception:
-    Fernet = None
-    InvalidToken = Exception
-
 try:
     from openai import OpenAI
 except Exception:
@@ -65,11 +59,13 @@ ORG = "GG"
 APP_DIR = Path(user_data_dir(APP_NAME, ORG))
 APP_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = APP_DIR / "config.json"
-API_KEY_PATH = APP_DIR / "api.key.enc"   # siempre esta ruta; si hay cifrado o no, lo auto-detectamos
-FERNET_KEY_PATH = APP_DIR / ".fernet.key"
 KNOWLEDGE_PATH = APP_DIR / "conocimientos.md"
 HISTORY_DIR = APP_DIR / "historial"
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+# API key: SIEMPRE en el escritorio D:\Desktop\main_api_key.txt
+DESKTOP_API_DIR = Path("D:/Desktop")
+DESKTOP_API_PATH = DESKTOP_API_DIR / "main_api_key.txt"
 
 def resource_path(rel: str) -> Path:
     base = getattr(sys, "_MEIPASS", None)
@@ -121,7 +117,6 @@ def split_sections(md: str) -> tuple[str, str]:
         end = nexts[0] if nexts else len(text)
         return text[start_pos:end].strip() + "\n"
 
-    # Buscar posiciones de los dos H1 (tolerante a espacios/case)
     pos_cono = pos_rol = None
     for pos, h in headers:
         nh = norm(h)
@@ -150,7 +145,6 @@ def merge_sections(cono_md: str, rol_md: str) -> str:
 class AppConfig:
     chat_model: str = "gpt-3.5-turbo"   # DEFAULT ECONÓMICO
     transcribe_model: str = "whisper-1"
-    use_encryption: bool = False        # preferencia UI; lectura es auto-detectada
 
     @staticmethod
     def load() -> "AppConfig":
@@ -160,58 +154,27 @@ class AppConfig:
                 return AppConfig(**data)
             except Exception:
                 pass
-        cfg = AppConfig(use_encryption=bool(Fernet))
+        cfg = AppConfig()
         cfg.save()
         return cfg
 
     def save(self):
         CONFIG_PATH.write_text(json.dumps(self.__dict__, indent=2), encoding="utf-8")
 
-def _ensure_fernet() -> Fernet | None:
-    if not Fernet:
-        return None
-    if not FERNET_KEY_PATH.exists():
-        FERNET_KEY_PATH.write_bytes(Fernet.generate_key())
-    return Fernet(FERNET_KEY_PATH.read_bytes())
-
-def _looks_like_fernet_token(s: str) -> bool:
-    # Heurística simple: tokens Fernet suelen empezar con 'gAAAA' y ser base64 largo
-    return bool(re.match(r'^gAAAA[A-Za-z0-9_\-]+=*', s.strip()))
-
-def save_api_key(api_key: str, use_encryption: bool):
+def save_api_key_to_desktop(api_key: str):
     if not api_key:
         raise ValueError("API key vacía")
-    if use_encryption and Fernet:
-        f = _ensure_fernet()
-        API_KEY_PATH.write_bytes(f.encrypt(api_key.encode("utf-8")))
-    else:
-        API_KEY_PATH.write_text(api_key, encoding="utf-8")
+    DESKTOP_API_DIR.mkdir(parents=True, exist_ok=True)
+    DESKTOP_API_PATH.write_text(api_key.strip(), encoding="utf-8")
 
-def load_api_key_auto() -> str | None:
-    """
-    Lee API key y, si detecta que el archivo contiene un token Fernet,
-    intenta descifrarlo automáticamente aunque la preferencia esté apagada.
-    """
-    if not API_KEY_PATH.exists():
-        return None
+def load_api_key_from_desktop() -> str | None:
     try:
-        raw = API_KEY_PATH.read_text(encoding="utf-8").strip()
+        if DESKTOP_API_PATH.exists():
+            txt = DESKTOP_API_PATH.read_text(encoding="utf-8").strip()
+            return txt or None
     except Exception:
         return None
-
-    if not raw:
-        return None
-
-    if _looks_like_fernet_token(raw) and Fernet:
-        try:
-            f = _ensure_fernet()
-            return f.decrypt(raw.encode("utf-8")).decode("utf-8")
-        except InvalidToken:
-            return None
-        except Exception:
-            return None
-    else:
-        return raw
+    return None
 
 # ------------------------
 # OpenAI
@@ -250,12 +213,10 @@ def ask_model(client: OpenAI, model: str, prompt: str) -> str:
 def transcribe_file(client: OpenAI, model: str, file_path: Path, logs=None) -> str:
     if logs: logs(f"Enviando a Whisper: {file_path.name}")
     with open(file_path, "rb") as f:
-        # SIN translate / SIN response_format para compatibilidad amplia
         tr = client.audio.transcriptions.create(
             model=model,
             file=f
         )
-    # SDKs devuelven .text; dejamos fallback informativo
     text = getattr(tr, "text", "") or json.dumps(getattr(tr, "__dict__", {}), ensure_ascii=False)
     if logs: logs(f"Texto recibido: {text[:120]}{'...' if len(text)>120 else ''}")
     return text
@@ -272,7 +233,7 @@ def _to_mono_float32(data) -> "np.ndarray":
         arr = arr.mean(axis=1)
     return arr.astype(np.float32, copy=False)
 
-def record_chunk_wav(seconds: int = 12, samplerate: int = 44100, channels: int = 2, logs=None) -> Path:
+def record_chunk_wav(seconds: int = 2, samplerate: int = 16000, channels: int = 2, logs=None) -> Path:
     """
     Captura un chunk WAV del AUDIO DEL PC (altavoces) usando soundcard (loopback).
     Si soundcard no está disponible o falla, cae a micrófono (sounddevice).
@@ -289,7 +250,6 @@ def record_chunk_wav(seconds: int = 12, samplerate: int = 44100, channels: int =
         except Exception:
             mic = None
 
-        # Si no encontró por nombre de altavoz, intenta cualquier loopback
         if mic is None:
             try:
                 loopbacks = [m for m in sc.all_microphones(include_loopback=True) if getattr(m, "isloopback", False)]
@@ -305,11 +265,9 @@ def record_chunk_wav(seconds: int = 12, samplerate: int = 44100, channels: int =
             try:
                 if logs: logs(f"Grabando altavoces (loopback) con '{mic.name}'…")
                 with mic.recorder(samplerate=samplerate) as rec:
-                    data = rec.record(numframes=int(seconds * samplerate))  # (frames, channels?) float
+                    data = rec.record(numframes=int(seconds * samplerate))  # float array
                 if logs and hasattr(data, "shape"): logs(f"Chunk capturado shape={getattr(data,'shape',None)}")
-                # A mono
                 data_mono = _to_mono_float32(data)
-                # Guardar WAV
                 if sf is not None:
                     sf.write(out.as_posix(), data_mono, samplerate)
                 else:
@@ -353,14 +311,9 @@ class SettingsPage(QtWidgets.QWidget):
 
         self.api_edit = QtWidgets.QLineEdit()
         self.api_edit.setEchoMode(QtWidgets.QLineEdit.Password)
-        # Placeholder si ya hay key guardada (cifrada o no)
-        if load_api_key_auto():
-            self.api_edit.setPlaceholderText("*** guardada ***")
-
-        self.show_chk = QtWidgets.QCheckBox("Mostrar")
-        self.show_chk.toggled.connect(
-            lambda on: self.api_edit.setEchoMode(QtWidgets.QLineEdit.Normal if on else QtWidgets.QLineEdit.Password)
-        )
+        # Placeholder si ya hay key guardada en D:\Desktop\main_api_key.txt
+        if load_api_key_from_desktop():
+            self.api_edit.setPlaceholderText("*** guardada en D:\\Desktop ***")
 
         self.model_cb = QtWidgets.QComboBox()
         self.model_cb.addItems(["gpt-3.5-turbo", "gpt-4o-mini", "gpt-4o"])
@@ -370,40 +323,33 @@ class SettingsPage(QtWidgets.QWidget):
         self.stt_cb.addItems(["whisper-1", "gpt-4o-transcribe"])
         self.stt_cb.setCurrentText(self.cfg.transcribe_model)
 
-        self.encrypt_chk = QtWidgets.QCheckBox("Cifrar API key (recomendado)")
-        self.encrypt_chk.setChecked(bool(self.cfg.use_encryption and (Fernet is not None)))
-
         save_btn = QtWidgets.QPushButton("Guardar")
         save_btn.clicked.connect(self._save)
 
         form.addRow("OpenAI API Key:", self.api_edit)
-        form.addRow("", self.show_chk)
         form.addRow("Modelo de chat:", self.model_cb)
         form.addRow("Modelo de transcripción:", self.stt_cb)
-        form.addRow("", self.encrypt_chk)
         form.addRow("", save_btn)
 
     def _save(self):
         self.cfg.chat_model = self.model_cb.currentText()
         self.cfg.transcribe_model = self.stt_cb.currentText()
-        self.cfg.use_encryption = bool(self.encrypt_chk.isChecked() and (Fernet is not None))
         self.cfg.save()
 
         val = self.api_edit.text().strip()
-        if val and val != "*** guardada ***":
-            try:
-                save_api_key(val, self.cfg.use_encryption)
+        try:
+            if val and val != "*** guardada en D:\\Desktop ***":
+                save_api_key_to_desktop(val)
                 self.api_edit.clear()
-                self.api_edit.setPlaceholderText("*** guardada ***")
-                self.log_signal.emit("API key guardada.")
-                QtWidgets.QMessageBox.information(self, "Guardado", "Configuración guardada y API key almacenada.")
-            except Exception as e:
-                self.log_signal.emit(f"[ERROR] Guardando API key: {e}")
-                QtWidgets.QMessageBox.critical(self, "Error", f"No se pudo guardar la API key: {e}")
-                return
-        else:
-            QtWidgets.QMessageBox.information(self, "Guardado", "Configuración guardada.")
-            self.log_signal.emit("Configuración guardada.")
+                self.api_edit.setPlaceholderText("*** guardada en D:\\Desktop ***")
+                self.log_signal.emit(f"API key guardada en {DESKTOP_API_PATH}")
+                QtWidgets.QMessageBox.information(self, "Guardado", "Configuración guardada y API key almacenada en D:\\Desktop.")
+            else:
+                QtWidgets.QMessageBox.information(self, "Guardado", "Configuración guardada.")
+                self.log_signal.emit("Configuración guardada.")
+        except Exception as e:
+            self.log_signal.emit(f"[ERROR] Guardando API key: {e}")
+            QtWidgets.QMessageBox.critical(self, "Error", f"No se pudo guardar la API key: {e}")
 
 class KnowledgePage(QtWidgets.QWidget):
     log_signal = QtCore.Signal(str)
@@ -474,9 +420,9 @@ class KnowledgePage(QtWidgets.QWidget):
 
 class ListenWorker(QtCore.QThread):
     """Hilo que graba en bucles y emite transcripciones incrementales."""
-    # Ajustes compatibles
-    chunk_seconds = 12
-    samplerate = 44100
+    # Latencia baja
+    chunk_seconds = 2
+    samplerate = 16000
     channels = 2
 
     new_text = QtCore.Signal(str)
@@ -502,7 +448,7 @@ class ListenWorker(QtCore.QThread):
                     size = wav.stat().st_size
                 except Exception:
                     size = 0
-                if size < 5000:
+                if size < 2000:
                     self.log.emit("(silencio)")
                 else:
                     text = transcribe_file(client, self.stt_model, wav, logs=lambda m: self.log.emit(m)).strip()
@@ -587,9 +533,9 @@ class ComposePage(QtWidgets.QWidget):
             self.btn_listen.setText("▶️ Empezar a escuchar")
             self.log_signal.emit("Escucha detenida.")
         else:
-            api_key = load_api_key_auto()
+            api_key = load_api_key_from_desktop()
             if not api_key:
-                QtWidgets.QMessageBox.warning(self, "API Key", "Configura tu API key en Settings.")
+                QtWidgets.QMessageBox.warning(self, "API Key", "Configura tu API key en Settings (se guardará en D:\\Desktop).")
                 return
             self.worker = ListenWorker(api_key, self.cfg.transcribe_model)
             self.worker.new_text.connect(self._on_new_transcript)
@@ -615,7 +561,7 @@ class ComposePage(QtWidgets.QWidget):
             QtWidgets.QMessageBox.information(self, "Sin cambios", "No hay nuevo contenido desde la última respuesta.")
             return
 
-        api_key = load_api_key_auto()
+        api_key = load_api_key_from_desktop()
         try:
             client = make_client(api_key)
         except Exception as e:
@@ -722,4 +668,5 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
