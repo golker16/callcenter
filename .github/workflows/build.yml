@@ -1,4 +1,4 @@
-name: build-windows-exe
+name: build-windows-onedir
 
 on:
   push:
@@ -15,7 +15,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
@@ -23,20 +23,21 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build (windowed, include conocimientos.md)
-        shell: bash
+      - name: Build (onedir, windowed, include conocimientos.md)
         run: |
-          # En Windows, PyInstaller usa ';' como separador de --add-data
-          pyinstaller --noconfirm --onefile --windowed \
-            --name CallCenterHelper \
-            --add-data "conocimientos.md;." \
+          pyinstaller --noconfirm --onedir --windowed --name CallCenterHelper ^
+            --collect-all PySide6 ^
+            --collect-all qdarkstyle ^
+            --add-data "conocimientos.md;." ^
             app.py
 
-      - name: Upload artifact (exe + conocimientos.md)
+      - name: Zip onedir folder
+        run: |
+          powershell -command "Compress-Archive -Path 'dist\\CallCenterHelper\\*' -DestinationPath 'dist\\CallCenterHelper_onedir.zip'"
+
+      - name: Upload artifact (onedir .zip)
         uses: actions/upload-artifact@v4
         with:
-          name: CallCenterHelper_build
-          path: |
-            dist/CallCenterHelper.exe
-            conocimientos.md
+          name: CallCenterHelper_onedir
+          path: dist/CallCenterHelper_onedir.zip
 
