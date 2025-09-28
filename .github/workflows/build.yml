@@ -29,6 +29,7 @@ jobs:
           pyinstaller --noconfirm --onedir --windowed --name CallCenterHelper ^
             --collect-all PySide6 ^
             --collect-all qdarkstyle ^
+            --collect-all sounddevice ^
             --add-data "conocimientos.md;." ^
             app.py
 
