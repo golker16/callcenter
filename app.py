@@ -128,7 +128,7 @@ def split_sections(md: str) -> tuple[str, str]:
         if nh == norm(H1_CONO): pos_cono = pos
         if nh == norm(H1_ROL):  pos_rol  = pos
 
-    if pos_cono is None y pos_rol is None:
+    if pos_cono is None and pos_rol is None:
         return (f"{H1_CONO}\n\n{text.strip()}\n", f"{H1_ROL}\n\n")
 
     cono = extract(pos_cono) if pos_cono is not None else f"{H1_CONO}\n\n"
@@ -181,7 +181,7 @@ def _looks_like_fernet_token(s: str) -> bool:
 def save_api_key(api_key: str, use_encryption: bool):
     if not api_key:
         raise ValueError("API key vacía")
-    if use_encryption y Fernet:
+    if use_encryption and Fernet:
         f = _ensure_fernet()
         API_KEY_PATH.write_bytes(f.encrypt(api_key.encode("utf-8")))
     else:
