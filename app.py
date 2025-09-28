@@ -6,18 +6,14 @@ CallCenter Helper – Qt + QDarkStyle (Whisper + GPT)
 - UI: PySide6 + QDarkStyle (oscuro).
 - Settings: guarda/lee API Key (cifrado local opcional).
 - Knowledge: editor con 2 pestañas ("Conocimientos" y "Rol") sobre un único conocimientos.md.
-- Compose (ES): dos modos -> "Escuchar PC (beta)" (transcribe) y "Escribir" (genera respuesta).
+- Compose (ES): "Escuchar PC" continuo con ▶️/⏸️, "🧠 Generar respuesta" usa SOLO lo nuevo desde
+  el último clic y mantiene memoria; "🆕 Nueva conversación" reinicia hilo.
 - Logs: pestaña para ver eventos y errores.
+- Historial: %APPDATA%/CallCenterHelper/historial/ conv_YYYYmmdd_HHMMSS.txt (transcripción + respuestas).
 - Build: PyInstaller --onedir --windowed (sin consola). Incluye conocimientos.md como recurso.
 
-Ruta de datos (Windows):
-  %APPDATA%/CallCenterHelper/
-    config.json
-    api.key.enc
-    conocimientos.md
-
-Primer arranque:
-- Si no existe conocimientos.md en APPDATA, se copia desde el recurso empacado (o desde el repo local).
+Requisitos:
+  pip install -r requirements.txt
 """
 
 from __future__ import annotations
@@ -25,7 +21,7 @@ import json
 import os
 import re
 import sys
-import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -45,13 +41,15 @@ try:
 except Exception:
     OpenAI = None
 
-# Audio (Escuchar PC / micrófono)
+# Audio
 try:
     import sounddevice as sd
     import soundfile as sf
+    import numpy as np
 except Exception:
     sd = None
     sf = None
+    np = None
 
 APP_NAME = "CallCenterHelper"
 ORG = "GG"
@@ -65,12 +63,10 @@ CONFIG_PATH = APP_DIR / "config.json"
 API_KEY_PATH = APP_DIR / "api.key.enc"
 FERNET_KEY_PATH = APP_DIR / ".fernet.key"
 KNOWLEDGE_PATH = APP_DIR / "conocimientos.md"
+HISTORY_DIR = APP_DIR / "historial"
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 def resource_path(rel: str) -> Path:
-    """
-    Devuelve la ruta de un recurso empacado (--add-data) o del directorio local.
-    En build onedir, PyInstaller expone sys._MEIPASS.
-    """
     base = getattr(sys, "_MEIPASS", None)
     if base:
         return Path(base) / rel
@@ -84,7 +80,6 @@ def ensure_knowledge_file():
     if src.exists():
         KNOWLEDGE_PATH.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     else:
-        # Fallback mínimo
         KNOWLEDGE_PATH.write_text("# Conocimientos del call center\n\n# Rol\n\n", encoding="utf-8")
 
 def read_knowledge() -> str:
@@ -97,12 +92,10 @@ def write_knowledge(text: str):
 # ------------------------
 # Knowledge split/merge (robusto)
 # ------------------------
-# Acepta variaciones de espacios y mayúsculas/minúsculas.
 H1_CONO = "# Conocimientos del call center"
 H1_ROL  = "# Rol"
 
 def _find_h1_positions(md: str) -> list[tuple[int, str]]:
-    """Devuelve [(pos, título-normalizado)] de todos los H1."""
     text = md.replace("\r\n", "\n")
     out = []
     for m in re.finditer(r'(?im)^\s*#\s*(.+?)\s*$', text):
@@ -111,14 +104,8 @@ def _find_h1_positions(md: str) -> list[tuple[int, str]]:
     return out
 
 def split_sections(md: str) -> tuple[str, str]:
-    """
-    Separa el markdown en dos secciones por H1:
-    '# Conocimientos del call center' y '# Rol'.
-    Preserva TODO el contenido. Si falta alguno, se crea vacío.
-    """
     text = md.replace("\r\n", "\n")
     headers = _find_h1_positions(text)
-    # mapa por título normalizado (lower, sin dobles espacios)
     def norm(s: str) -> str:
         return re.sub(r'\s+', ' ', s.strip().lower())
 
@@ -127,23 +114,17 @@ def split_sections(md: str) -> tuple[str, str]:
     n_rol  = norm(H1_ROL)
 
     def extract(start_pos: int) -> str:
-        # tramo desde start_pos hasta el siguiente H1 o fin
-        h_starts = sorted([p for p, _ in headers])
-        next_starts = [p for p in h_starts if p > start_pos]
-        end = next_starts[0] if next_starts else len(text)
+        starts = sorted([p for p, _ in headers])
+        nexts = [p for p in starts if p > start_pos]
+        end = nexts[0] if nexts else len(text)
         return text[start_pos:end].strip() + "\n"
 
-    # Buscar posiciones (aceptando variantes de espacios y case)
-    pos_cono = None
-    pos_rol = None
+    pos_cono = None; pos_rol = None
     for pos, h in headers:
-        if norm(h) == n_cono:
-            pos_cono = pos
-        if norm(h) == n_rol:
-            pos_rol = pos
+        if norm(h) == n_cono: pos_cono = pos
+        if norm(h) == n_rol:  pos_rol  = pos
 
     if pos_cono is None and pos_rol is None:
-        # No hay H1 reconocidos → todo a conocimientos
         return (f"{H1_CONO}\n\n{text.strip()}\n", f"{H1_ROL}\n\n")
 
     cono = extract(pos_cono) if pos_cono is not None else f"{H1_CONO}\n\n"
@@ -151,8 +132,7 @@ def split_sections(md: str) -> tuple[str, str]:
     return (cono, rol)
 
 def merge_sections(cono_md: str, rol_md: str) -> str:
-    cono_md = cono_md.strip()
-    rol_md  = rol_md.strip()
+    cono_md = cono_md.strip(); rol_md  = rol_md.strip()
     if not re.match(r'(?is)^\s*#\s*conocimientos del call center', cono_md):
         cono_md = f"{H1_CONO}\n\n{cono_md}"
     if not re.match(r'(?is)^\s*#\s*rol', rol_md):
@@ -247,57 +227,45 @@ def ask_model(client: OpenAI, model: str, prompt: str) -> str:
 def transcribe_file(client: OpenAI, model: str, file_path: Path) -> str:
     with open(file_path, "rb") as f:
         tr = client.audio.transcriptions.create(model=model, file=f)
-    # SDK suele exponer .text
-    text = getattr(tr, "text", None)
-    if not text:
-        # por si cambia el esquema
-        text = json.dumps(tr.__dict__, ensure_ascii=False)
-    return text
+    return getattr(tr, "text", "") or json.dumps(getattr(tr, "__dict__", {}), ensure_ascii=False)
 
 # ------------------------
-# Audio helpers (Escuchar PC / Mic)
+# Audio helpers
 # ------------------------
-def record_system_or_mic_wav(seconds: int, samplerate: int = 48000, channels: int = 2, logs: callable | None = None) -> Path:
+def record_chunk_wav(seconds: int = 8, samplerate: int = 48000, channels: int = 2, logs=None) -> Path:
     """
-    Intenta capturar LOOPBACK (audio del sistema) con WASAPI.
-    Si falla, cae a micrófono. Requiere sounddevice + soundfile.
-    Devuelve ruta a WAV temporal.
+    Captura un chunk WAV:
+      - Intenta WASAPI loopback (audio del sistema) en Windows.
+      - Si falla, cae a micrófono.
+    Devuelve ruta al WAV temporal.
     """
-    if sd is None or sf is None:
-        raise RuntimeError("Falta instalar 'sounddevice' y 'soundfile'.")
+    if sd is None or sf is None or np is None:
+        raise RuntimeError("Falta instalar 'sounddevice', 'soundfile' y 'numpy'.")
 
-    tmp = Path(tempfile.gettempdir()) / f"cchelper_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+    tmp = Path(APP_DIR) / f"chunk_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.wav"
 
     try:
-        # WASAPI loopback (Windows)
         wasapi = sd.WasapiSettings(loopback=True)
-        if logs: logs("Intentando capturar audio del sistema (WASAPI loopback)…")
-        frames = int(seconds * samplerate)
+        if logs: logs("Grabando (loopback)…")
         buf = []
 
-        def callback(indata, frames_, time_, status):
-            if status and logs:
-                logs(f"sd status: {status}")
+        def cb(indata, frames, time_info, status):
+            if status and logs: logs(f"sd status: {status}")
             buf.append(indata.copy())
 
         with sd.InputStream(samplerate=samplerate, channels=channels, dtype="float32",
-                            extra_settings=wasapi, callback=callback):
+                            extra_settings=wasapi, callback=cb):
             sd.sleep(int(seconds * 1000))
 
-        import numpy as np
-        data = np.concatenate(buf, axis=0) if buf else np.zeros((1, channels), dtype="float32")
+        data = np.concatenate(buf, axis=0) if buf else np.zeros((samplerate*seconds, channels), dtype="float32")
         sf.write(tmp.as_posix(), data, samplerate)
-        if logs: logs(f"Audio capturado en {tmp}")
         return tmp
 
     except Exception as e:
-        if logs: logs(f"Loopback falló ({e}). Usando micrófono…")
-        # Micrófono
-        import numpy as np
-        recording = sd.rec(int(seconds * samplerate), samplerate=samplerate, channels=1, dtype="float32")
+        if logs: logs(f"Loopback no disponible ({e}). Grabando micrófono…")
+        rec = sd.rec(int(seconds * samplerate), samplerate=samplerate, channels=1, dtype="float32")
         sd.wait()
-        sf.write(tmp.as_posix(), recording, samplerate)
-        if logs: logs(f"Audio de micrófono guardado en {tmp}")
+        sf.write(tmp.as_posix(), rec, samplerate)
         return tmp
 
 # ------------------------
@@ -323,7 +291,6 @@ class SettingsPage(QtWidgets.QWidget):
         )
 
         self.model_cb = QtWidgets.QComboBox()
-        # DEFAULT: gpt-3.5-turbo en primer lugar
         self.model_cb.addItems(["gpt-3.5-turbo", "gpt-4o-mini", "gpt-4o"])
         self.model_cb.setCurrentText(self.cfg.chat_model)
 
@@ -375,7 +342,6 @@ class KnowledgePage(QtWidgets.QWidget):
         ensure_knowledge_file()
 
         v = QtWidgets.QVBoxLayout(self)
-
         self.tabs = QtWidgets.QTabWidget()
         v.addWidget(self.tabs)
 
@@ -389,7 +355,7 @@ class KnowledgePage(QtWidgets.QWidget):
 
         self.tabs.addTab(self.cono_edit, "Conocimientos")
         self.tabs.addTab(self.rol_edit, "Rol")
-        self.tabs.setCurrentIndex(0)  # por defecto la primera
+        self.tabs.setCurrentIndex(0)
 
         h = QtWidgets.QHBoxLayout()
         save_btn = QtWidgets.QPushButton("Guardar")
@@ -411,8 +377,7 @@ class KnowledgePage(QtWidgets.QWidget):
 
     def _export(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Exportar como...", str(Path.home()/ "conocimientos.md"), "Markdown (*.md)")
-        if not path:
-            return
+        if not path: return
         try:
             merged = merge_sections(self.cono_edit.toPlainText(), self.rol_edit.toPlainText())
             Path(path).write_text(merged, encoding="utf-8")
@@ -424,8 +389,7 @@ class KnowledgePage(QtWidgets.QWidget):
 
     def _import(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Importar .md", str(Path.home()), "Markdown (*.md);;Text (*.txt);;All (*.*)")
-        if not path:
-            return
+        if not path: return
         try:
             data = Path(path).read_text(encoding="utf-8", errors="ignore")
             cono_md, rol_md = split_sections(data)
@@ -436,134 +400,140 @@ class KnowledgePage(QtWidgets.QWidget):
             self.log_signal.emit(f"[ERROR] Importar: {e}")
             QtWidgets.QMessageBox.critical(self, "Error", f"No se pudo importar: {e}")
 
+class ListenWorker(QtCore.QThread):
+    """Hilo que graba en bucles y emite transcripciones incrementales."""
+    chunk_seconds = 8
+    new_text = QtCore.Signal(str)
+    log = QtCore.Signal(str)
+
+    def __init__(self, api_key: str, stt_model: str, parent=None):
+        super().__init__(parent)
+        self.api_key = api_key
+        self.stt_model = stt_model
+        self._running = False
+
+    def run(self):
+        self._running = True
+        try:
+            client = make_client(self.api_key)
+        except Exception as e:
+            self.log.emit(f"[ERROR] {e}")
+            return
+        while self._running:
+            try:
+                wav = record_chunk_wav(self.chunk_seconds, logs=lambda m: self.log.emit(m))
+                text = transcribe_file(client, self.stt_model, wav).strip()
+                try:
+                    wav.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                if text:
+                    # Nota: Pediste transcripción en inglés → asumimos Whisper entrega EN (o traduce con modelo si aplica)
+                    self.new_text.emit(text)
+            except Exception as e:
+                self.log.emit(f"[ERROR] Transcripción: {e}")
+            # sin sleep adicional; el chunk_seconds marca el ritmo
+
+    def stop(self):
+        self._running = False
+
 class ComposePage(QtWidgets.QWidget):
     log_signal = QtCore.Signal(str)
-    paste_transcript = QtCore.Signal(str)
 
     def __init__(self, cfg: AppConfig):
         super().__init__()
         self.cfg = cfg
 
-        layout = QtWidgets.QVBoxLayout(self)
+        self.listening = False
+        self.worker: ListenWorker | None = None
 
-        # Subpestañas (dos modos)
-        self.modes = QtWidgets.QTabWidget()
-        layout.addWidget(self.modes)
+        self.conversation_file: Path | None = None
+        self._ensure_new_conversation()  # arranca con un archivo
 
-        # --- Modo 1: Escuchar PC (beta) ---
-        self._build_listen_tab()
+        # Puntero de "desde dónde" generar la siguiente respuesta
+        self.last_processed_len = 0
 
-        # --- Modo 2: Escribir ---
-        self._build_write_tab()
+        v = QtWidgets.QVBoxLayout(self)
 
-    # ====== Escuchar PC (beta) ======
-    def _build_listen_tab(self):
-        tab = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(tab)
+        # Controles principales (ES)
+        hb = QtWidgets.QHBoxLayout()
+        self.btn_listen = QtWidgets.QPushButton("▶️ Empezar a escuchar")
+        self.btn_generate = QtWidgets.QPushButton("🧠 Generar respuesta")
+        self.btn_newconv = QtWidgets.QPushButton("🆕 Nueva conversación")
+        hb.addWidget(self.btn_listen); hb.addWidget(self.btn_generate); hb.addWidget(self.btn_newconv); hb.addStretch(1)
+        v.addLayout(hb)
 
-        info = QtWidgets.QLabel("Graba audio del sistema (WASAPI loopback) o micrófono si no está disponible.\n"
-                                "Luego se transcribe con Whisper.")
-        info.setWordWrap(True)
-        v.addWidget(info)
-
-        # Controles
-        form = QtWidgets.QHBoxLayout()
-        self.seconds_sb = QtWidgets.QSpinBox()
-        self.seconds_sb.setRange(3, 120)
-        self.seconds_sb.setValue(15)
-        form.addWidget(QtWidgets.QLabel("Duración (s):"))
-        form.addWidget(self.seconds_sb)
-
-        self.btn_record = QtWidgets.QPushButton("Grabar y transcribir")
-        form.addWidget(self.btn_record)
-        form.addStretch(1)
-        v.addLayout(form)
-
-        # Resultado de transcripción
+        # Transcripción acumulada
+        trans_group = QtWidgets.QGroupBox("TRANSCRIPCIÓN (Whisper)")
+        trans_layout = QtWidgets.QVBoxLayout(trans_group)
         self.transcript = QtWidgets.QPlainTextEdit()
-        self.transcript.setPlaceholderText("Transcripción…")
-        v.addWidget(self.transcript, 2)
+        trans_layout.addWidget(self.transcript)
+        v.addWidget(trans_group, 2)
 
-        # Botones aplicar/enviar
-        hb = QtWidgets.QHBoxLayout()
-        self.btn_to_writer = QtWidgets.QPushButton("Pegar en 'Escribir'")
-        hb.addWidget(self.btn_to_writer)
-        hb.addStretch(1)
-        v.addLayout(hb)
-
-        self.modes.addTab(tab, "Escuchar PC (beta)")
-
-        # Signals
-        self.btn_record.clicked.connect(self._on_record_transcribe)
-        self.btn_to_writer.clicked.connect(lambda: self.paste_transcript.emit(self.transcript.toPlainText().strip()))
-
-    def _on_record_transcribe(self):
-        secs = int(self.seconds_sb.value())
-        self.transcript.setPlainText("Grabando/transcribiendo…")
-
-        api_key = load_api_key(False) or load_api_key(True)
-        if not api_key:
-            QtWidgets.QMessageBox.warning(self, "API Key", "Configura tu API key en Settings.")
-            self.transcript.setPlainText("")
-            return
-        try:
-            client = make_client(api_key)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", str(e))
-            self.transcript.setPlainText("")
-            return
-
-        def worker():
-            try:
-                wav_path = record_system_or_mic_wav(secs, logs=lambda m: self.log_signal.emit(m))
-                text = transcribe_file(client, self.cfg.transcribe_model, wav_path)
-                self.transcript.setPlainText(text)
-                self.log_signal.emit("Transcripción lista.")
-            except Exception as e:
-                self.transcript.setPlainText(f"[ERROR] {e}")
-                self.log_signal.emit(f"[ERROR] {e}")
-
-        QtCore.QThreadPool.globalInstance().start(_Runnable(worker))
-
-    # ====== Escribir ======
-    def _build_write_tab(self):
-        tab = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(tab)
-
-        in_group = QtWidgets.QGroupBox("Escribe o pega un fragmento / resumen de la llamada")
-        in_layout = QtWidgets.QVBoxLayout(in_group)
-        self.input = QtWidgets.QPlainTextEdit()
-        in_layout.addWidget(self.input)
-        v.addWidget(in_group, 2)
-
-        hb = QtWidgets.QHBoxLayout()
-        self.btn_suggest = QtWidgets.QPushButton("Sugerir respuesta (inglés)")
-        self.btn_clear = QtWidgets.QPushButton("Limpiar")
-        hb.addWidget(self.btn_suggest); hb.addWidget(self.btn_clear); hb.addStretch(1)
-        v.addLayout(hb)
-
-        out_group = QtWidgets.QGroupBox("Respuesta sugerida")
+        # Respuesta
+        out_group = QtWidgets.QGroupBox("RESPUESTA (GPT)")
         out_layout = QtWidgets.QVBoxLayout(out_group)
         self.output = QtWidgets.QPlainTextEdit(); self.output.setReadOnly(True)
         out_layout.addWidget(self.output)
         v.addWidget(out_group, 2)
 
-        self.modes.addTab(tab, "Escribir")
+        # Conexiones
+        self.btn_listen.clicked.connect(self._toggle_listen)
+        self.btn_generate.clicked.connect(self._generate_reply)
+        self.btn_newconv.clicked.connect(self._new_conversation)
 
-        # Conectar señales
-        self.btn_clear.clicked.connect(lambda: self.input.setPlainText(""))
-        self.btn_suggest.clicked.connect(self._on_suggest)
-        self.paste_transcript.connect(lambda t: self._paste_into_writer(t))
+    # ---- Conversación / historial ----
+    def _ensure_new_conversation(self):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.conversation_file = HISTORY_DIR / f"conv_{ts}.txt"
+        self.conversation_file.write_text(f"=== Conversation started {datetime.now().isoformat()} ===\n", encoding="utf-8")
+        self.last_processed_len = 0
 
-    def _paste_into_writer(self, text: str):
-        self.modes.setCurrentIndex(1)  # Cambiar a "Escribir"
-        if text:
-            self.input.setPlainText(text)
+    def _append_history(self, text: str):
+        if self.conversation_file:
+            with self.conversation_file.open("a", encoding="utf-8") as f:
+                f.write(text)
 
-    def _on_suggest(self):
-        text = self.input.toPlainText().strip()
-        if not text:
-            QtWidgets.QMessageBox.information(self, "Vacío", "Escribe o pega algo primero.")
+    # ---- Escuchar PC ----
+    def _toggle_listen(self):
+        if self.listening:
+            # Stop
+            if self.worker:
+                self.worker.stop()
+                self.worker.wait(2000)
+                self.worker = None
+            self.listening = False
+            self.btn_listen.setText("▶️ Empezar a escuchar")
+            self.log_signal.emit("Escucha detenida.")
+        else:
+            # Start
+            api_key = load_api_key(False) or load_api_key(True)
+            if not api_key:
+                QtWidgets.QMessageBox.warning(self, "API Key", "Configura tu API key en Settings.")
+                return
+            self.worker = ListenWorker(api_key, self.cfg.transcribe_model)
+            self.worker.new_text.connect(self._on_new_transcript)
+            self.worker.log.connect(lambda m: self.log_signal.emit(m))
+            self.worker.start()
+            self.listening = True
+            self.btn_listen.setText("⏸️ Dejar de escuchar")
+            self.log_signal.emit("Escuchando…")
+
+    @QtCore.Slot(str)
+    def _on_new_transcript(self, text: str):
+        # Agrega con salto y guarda a historial
+        if self.transcript.toPlainText():
+            self.transcript.appendPlainText("\n" + text)
+        else:
+            self.transcript.setPlainText(text)
+        self._append_history(f"[WHISPER] {text}\n")
+
+    # ---- Generar respuesta ----
+    def _generate_reply(self):
+        full = self.transcript.toPlainText()
+        new_segment = full[self.last_processed_len:].strip()
+        if not new_segment:
+            QtWidgets.QMessageBox.information(self, "Sin cambios", "No hay nuevo contenido desde la última respuesta.")
             return
 
         api_key = load_api_key(False) or load_api_key(True)
@@ -574,19 +544,35 @@ class ComposePage(QtWidgets.QWidget):
             QtWidgets.QMessageBox.critical(self, "Error", str(e))
             return
 
-        prompt = build_prompt(text)
-        self.output.setPlainText("Generando…")
+        # Prompt con KNOWLEDGE + solo el tramo nuevo, pero le damos contexto corto previo
+        # (últimos 800 caracteres) para mantener un poco de hilo
+        context_tail = full[max(0, self.last_processed_len - 800):self.last_processed_len]
+        prompt = build_prompt(context_tail + "\n" + new_segment)
+        self.output.setPlainText("Generating…")
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         QtWidgets.QApplication.processEvents()
         try:
             reply = ask_model(client, self.cfg.chat_model, prompt)
             self.output.setPlainText(reply)
-            self.log_signal.emit("Sugerencia generada.")
+            self.last_processed_len = len(full)
+            # Guardar a historial
+            self._append_history(f"[GPT] {reply}\n")
+            self.log_signal.emit("Respuesta generada.")
         except Exception as e:
             self.output.setPlainText(f"[ERROR] {e}")
             self.log_signal.emit(f"[ERROR] {e}")
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
+
+    # ---- Nueva conversación ----
+    def _new_conversation(self):
+        # Detener escucha si está activa
+        if self.listening:
+            self._toggle_listen()
+        self.transcript.setPlainText("")
+        self.output.setPlainText("")
+        self._ensure_new_conversation()
+        self.log_signal.emit("Nueva conversación iniciada.")
 
 class LogsPage(QtWidgets.QWidget):
     def __init__(self):
@@ -602,14 +588,6 @@ class LogsPage(QtWidgets.QWidget):
         self.box.appendPlainText(f"[{ts}] {msg}")
         self.box.verticalScrollBar().setValue(self.box.verticalScrollBar().maximum())
 
-# Helper para ejecutar funciones en ThreadPool
-class _Runnable(QtCore.QRunnable):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-    def run(self):
-        self.fn()
-
 # ------------------------
 # Main Window
 # ------------------------
@@ -617,7 +595,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CallCenter Helper – Whisper + GPT")
-        self.resize(1100, 750)
+        self.resize(1120, 760)
 
         self.cfg = AppConfig.load()
         ensure_knowledge_file()
@@ -625,29 +603,26 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs = QtWidgets.QTabWidget()
         self.setCentralWidget(tabs)
 
-        # Pages
+        # Orden: COMPOSE primero (por defecto)
         self.compose  = ComposePage(self.cfg)
         self.settings = SettingsPage(self.cfg)
         self.knowledge = KnowledgePage()
         self.logs     = LogsPage()
 
-        # Orden: COMPOSE primero (por defecto)
         tabs.addTab(self.compose, "Compose")
         tabs.addTab(self.settings, "Settings")
         tabs.addTab(self.knowledge, "Knowledge")
         tabs.addTab(self.logs, "Logs")
-        tabs.setCurrentWidget(self.compose)  # pestaña por defecto
+        tabs.setCurrentWidget(self.compose)
 
         # Wiring logs
         self.settings.log_signal.connect(self.logs.append)
         self.knowledge.log_signal.connect(self.logs.append)
         self.compose.log_signal.connect(self.logs.append)
 
-        # Status bar: knowledge path + last modified
+        # Status: knowledge path + last modified
         self.status = self.statusBar()
         self._update_status()
-
-        # Knowledge changed → update status
         self.knowledge.knowledge_changed.connect(self._update_status)
 
     @QtCore.Slot()
@@ -662,7 +637,6 @@ def main():
     app = QtWidgets.QApplication([])
     app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api='pyside6'))
 
-    # Icono (opcional futuro): assets/icon.ico
     icon_path = resource_path('assets/icon.ico')
     if icon_path.exists():
         app.setWindowIcon(QtGui.QIcon(str(icon_path)))
@@ -673,6 +647,7 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 
