@@ -4,8 +4,9 @@ openai>=1.40
 appdirs>=1.4
 cryptography>=42.0
 
+
 # Audio
 soundcard==0.4.2
-sounddevice>=0.4.7
+sounddevice>=0.4
 soundfile>=0.12
 numpy<2
